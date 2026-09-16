@@ -17,7 +17,3 @@ For officially supported platforms and versions, refer to the documentation for 
 This repository contains generated test results and is not intended for reporting SDK issues.
 
 For SDK support or to report an issue, use the support channels or issue tracker associated with the corresponding Twilio SDK.
-
-## LICENSE
-
-Twilio Programmable Voice and Video SDKs are distributed under TWILIO-TOS. [https://www.twilio.com/legal/tos](https://www.twilio.com/legal/tos)
