@@ -11,6 +11,9 @@ terraform {
 
 provider "aws" {
   region = "us-east-1"
+  # Fail fast if the active AWS profile is the wrong account, instead of
+  # creating the role there.
+  allowed_account_ids = [local.account_id]
 }
 
 locals {
