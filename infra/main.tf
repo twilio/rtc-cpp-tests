@@ -21,16 +21,25 @@ locals {
   github_repo = "twilio/rtc-cpp-tests"
   test_bucket = "cpp-test-artifacts"
 
+  # This repo uses GitHub's immutable OIDC subject claims, so the `sub` prefix
+  # carries the owner and repo IDs (twilio = 109142, rtc-cpp-tests = 1371610559),
+  # not just their names: `repo:twilio@109142/rtc-cpp-tests@1371610559`. A token
+  # with the name-only prefix never arrives, so matching on it fails every
+  # AssumeRoleWithWebIdentity. The IDs also mean a repo deleted and recreated
+  # under the same name can't assume this role. Current value:
+  # `gh api repos/twilio/rtc-cpp-tests/actions/oidc/customization/sub`.
+  github_sub_prefix = "repo:twilio@109142/rtc-cpp-tests@1371610559"
+
   # The `refs/heads/*` sub pattern below is the SOLE control excluding fork PRs
   # from assuming this role. Fork PRs DO get an OIDC token from GitHub — the
-  # exclusion works because their `sub` claim is `repo:<owner>/<repo>:pull_request`
-  # (not `ref:refs/heads/...`), which does not match this pattern.
+  # exclusion works because their `sub` claim is `<prefix>:pull_request`
+  # (not `<prefix>:ref:refs/heads/...`), which does not match this pattern.
   #
-  # DO NOT widen this to `repo:${local.github_repo}:*` without a security review.
+  # DO NOT widen this to `${local.github_sub_prefix}:*` without a security review.
   # On a public repo, a `:*` wildcard would grant this role to any fork PR run.
   # Any expansion (tags, environments, workflow_ref) must be added as explicit,
   # narrowly-scoped alternatives — never as a wildcard.
-  oidc_sub_pattern = "repo:${local.github_repo}:ref:refs/heads/*"
+  oidc_sub_pattern = "${local.github_sub_prefix}:ref:refs/heads/*"
 }
 
 # GitHub's OIDC provider is a per-AWS-account singleton. If Terraform errors
