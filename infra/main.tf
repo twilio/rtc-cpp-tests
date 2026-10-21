@@ -81,6 +81,13 @@ resource "aws_iam_role" "github" {
   description        = "GitHub Actions OIDC role for ${local.github_repo}. Read-only on s3://${local.test_bucket} for pulling rtc-cpp test artifacts."
 }
 
+# The tarballs are encrypted with a customer-managed KMS key owned by rtc-cpp's
+# infra/ (VBLOCKS-7414). That key must exist before this is applied: rtc-cpp
+# applies its key first, then this, then switches the bucket default to the key.
+data "aws_kms_alias" "test_artifacts" {
+  name = "alias/${local.test_bucket}"
+}
+
 data "aws_iam_policy_document" "test_artifacts_read" {
   # Read-only on the packages/ prefix rtc-cpp uploads to. GetObjectVersion is
   # required for the dispatch path, which downloads with `--version-id`.
@@ -100,6 +107,19 @@ data "aws_iam_policy_document" "test_artifacts_read" {
       test     = "StringLike"
       variable = "s3:prefix"
       values   = ["packages/*", "packages/"]
+    }
+  }
+  # Decrypt the SSE-KMS tarballs. Only through S3 (kms:ViaService), so the role
+  # can't use the key on anything except objects it can already GetObject.
+  # Older SSE-S3 objects need no KMS permission and still read without it.
+  statement {
+    effect    = "Allow"
+    actions   = ["kms:Decrypt"]
+    resources = [data.aws_kms_alias.test_artifacts.target_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["s3.us-east-1.amazonaws.com"]
     }
   }
 }
