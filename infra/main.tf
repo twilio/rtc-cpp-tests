@@ -30,16 +30,19 @@ locals {
   # `gh api repos/twilio/rtc-cpp-tests/actions/oidc/customization/sub`.
   github_sub_prefix = "repo:twilio@109142/rtc-cpp-tests@1371610559"
 
-  # The `refs/heads/*` sub pattern below is the SOLE control excluding fork PRs
-  # from assuming this role. Fork PRs DO get an OIDC token from GitHub — the
-  # exclusion works because their `sub` claim is `<prefix>:pull_request`
-  # (not `<prefix>:ref:refs/heads/...`), which does not match this pattern.
+  # Only runs on `main` may assume this role. `main` is the only protected
+  # branch, and repository_dispatch always runs there. Any branch would let
+  # anyone who can push one (a collaborator, or anyone holding a token with
+  # repo/workflow scope) run a modified workflow that reads and decrypts the
+  # private test binaries, and this repo's Actions logs are public.
   #
-  # DO NOT widen this to `${local.github_sub_prefix}:*` without a security review.
-  # On a public repo, a `:*` wildcard would grant this role to any fork PR run.
-  # Any expansion (tags, environments, workflow_ref) must be added as explicit,
-  # narrowly-scoped alternatives — never as a wildcard.
-  oidc_sub_pattern = "${local.github_sub_prefix}:ref:refs/heads/*"
+  # The exact match also excludes fork PRs: they get an OIDC token, but its
+  # `sub` is `<prefix>:pull_request`, which never matches.
+  #
+  # DO NOT widen this (to other branches, `refs/heads/*`, or `:*`) without a
+  # security review. Any expansion (e.g. a protected GitHub environment) must
+  # be an explicit, narrowly scoped alternative, never a wildcard.
+  oidc_sub = "${local.github_sub_prefix}:ref:refs/heads/main"
 }
 
 # GitHub's OIDC provider is a per-AWS-account singleton. If Terraform errors
@@ -62,9 +65,9 @@ data "aws_iam_policy_document" "assume_role" {
     }
 
     condition {
-      test     = "StringLike"
+      test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = [local.oidc_sub_pattern]
+      values   = [local.oidc_sub]
     }
 
     condition {
