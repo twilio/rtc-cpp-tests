@@ -10,7 +10,7 @@ terraform {
 }
 
 provider "aws" {
-  region = "us-east-1"
+  region = local.region
   # Fail fast if the active AWS profile is the wrong account, instead of
   # creating the role there.
   allowed_account_ids = [local.account_id]
@@ -18,6 +18,7 @@ provider "aws" {
 
 locals {
   account_id  = "897837310411"
+  region      = "us-east-1"
   github_repo = "twilio/rtc-cpp-tests"
   test_bucket = "cpp-test-artifacts"
 
@@ -30,16 +31,19 @@ locals {
   # `gh api repos/twilio/rtc-cpp-tests/actions/oidc/customization/sub`.
   github_sub_prefix = "repo:twilio@109142/rtc-cpp-tests@1371610559"
 
-  # The `refs/heads/*` sub pattern below is the SOLE control excluding fork PRs
-  # from assuming this role. Fork PRs DO get an OIDC token from GitHub — the
-  # exclusion works because their `sub` claim is `<prefix>:pull_request`
-  # (not `<prefix>:ref:refs/heads/...`), which does not match this pattern.
+  # Only runs on `main` may assume this role. `main` is the only protected
+  # branch, and repository_dispatch always runs there. Any branch would let
+  # anyone who can push one (a collaborator, or anyone holding a token with
+  # repo/workflow scope) run a modified workflow that reads and decrypts the
+  # private test binaries, and this repo's Actions logs are public.
   #
-  # DO NOT widen this to `${local.github_sub_prefix}:*` without a security review.
-  # On a public repo, a `:*` wildcard would grant this role to any fork PR run.
-  # Any expansion (tags, environments, workflow_ref) must be added as explicit,
-  # narrowly-scoped alternatives — never as a wildcard.
-  oidc_sub_pattern = "${local.github_sub_prefix}:ref:refs/heads/*"
+  # The exact match also excludes fork PRs: they get an OIDC token, but its
+  # `sub` is `<prefix>:pull_request`, which never matches.
+  #
+  # DO NOT widen this (to other branches, `refs/heads/*`, or `:*`) without a
+  # security review. Any expansion (e.g. a protected GitHub environment) must
+  # be an explicit, narrowly scoped alternative, never a wildcard.
+  oidc_sub = "${local.github_sub_prefix}:ref:refs/heads/main"
 }
 
 # GitHub's OIDC provider is a per-AWS-account singleton. If Terraform errors
@@ -62,9 +66,9 @@ data "aws_iam_policy_document" "assume_role" {
     }
 
     condition {
-      test     = "StringLike"
+      test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = [local.oidc_sub_pattern]
+      values   = [local.oidc_sub]
     }
 
     condition {
@@ -79,6 +83,13 @@ resource "aws_iam_role" "github" {
   name               = "rtc-cpp-tests-github-role"
   assume_role_policy = data.aws_iam_policy_document.assume_role.json
   description        = "GitHub Actions OIDC role for ${local.github_repo}. Read-only on s3://${local.test_bucket} for pulling rtc-cpp test artifacts."
+}
+
+# The tarballs are encrypted with a customer-managed KMS key owned by rtc-cpp's
+# infra/ (VBLOCKS-7414). That key must exist before this is applied: rtc-cpp
+# applies its key first, then this, then switches the bucket default to the key.
+data "aws_kms_alias" "test_artifacts" {
+  name = "alias/${local.test_bucket}"
 }
 
 data "aws_iam_policy_document" "test_artifacts_read" {
@@ -100,6 +111,19 @@ data "aws_iam_policy_document" "test_artifacts_read" {
       test     = "StringLike"
       variable = "s3:prefix"
       values   = ["packages/*", "packages/"]
+    }
+  }
+  # Decrypt the SSE-KMS tarballs. Only through S3 (kms:ViaService), so the role
+  # can't use the key on anything except objects it can already GetObject.
+  # Older SSE-S3 objects need no KMS permission and still read without it.
+  statement {
+    effect    = "Allow"
+    actions   = ["kms:Decrypt"]
+    resources = [data.aws_kms_alias.test_artifacts.target_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["s3.${local.region}.amazonaws.com"]
     }
   }
 }
