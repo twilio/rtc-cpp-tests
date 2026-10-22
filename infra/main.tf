@@ -10,7 +10,7 @@ terraform {
 }
 
 provider "aws" {
-  region = "us-east-1"
+  region = local.region
   # Fail fast if the active AWS profile is the wrong account, instead of
   # creating the role there.
   allowed_account_ids = [local.account_id]
@@ -18,6 +18,7 @@ provider "aws" {
 
 locals {
   account_id  = "897837310411"
+  region      = "us-east-1"
   github_repo = "twilio/rtc-cpp-tests"
   test_bucket = "cpp-test-artifacts"
 
@@ -122,7 +123,7 @@ data "aws_iam_policy_document" "test_artifacts_read" {
     condition {
       test     = "StringEquals"
       variable = "kms:ViaService"
-      values   = ["s3.us-east-1.amazonaws.com"]
+      values   = ["s3.${local.region}.amazonaws.com"]
     }
   }
 }
