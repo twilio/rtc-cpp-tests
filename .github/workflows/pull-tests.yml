@@ -13,7 +13,8 @@ on:
         required: false
         default: ""
   repository_dispatch:
-    # Fired by rtc-cpp Buildkite after all linux+darwin builds land in S3.
+    # Fired by rtc-cpp Buildkite after all linux+darwin builds land in S3 and
+    # the linux sanitizer builds finish (a failed one is left out).
     # Payload shape:
     #   {
     #     "project": "voice"|"video",
@@ -152,6 +153,9 @@ jobs:
                   fail(f"repository_dispatch payload must carry exactly one debug and one release "
                        f"artifact for {platform}/{arch}",
                        f"build_types={[a.get('build_type') for a in regular]!r}")
+              # The allowlist and build_type checks below must run before any fail()
+              # that names `san`/`label`: those come from the payload, and are only
+              # safe in the public log once they're known to be allowed values.
               allowed = SANITIZERS[project] if (platform, arch) == SANITIZER_CONFIG[:2] else ()
               names = [a.get("sanitizer") for a in sanitized]
               if len(set(names)) != len(names) or not set(names) <= set(allowed):
@@ -233,13 +237,15 @@ jobs:
               artifacts = [artifact(bt, None, expected_key(project, platform, arch, bt, sha), "")
                            for bt in BUILD_TYPES]
               # Sanitizer tarballs are optional: take the ones this build uploaded.
+              # Listed by the exact key as prefix, so only that object can match.
               if (platform, arch) == SANITIZER_CONFIG[:2]:
                   bt = SANITIZER_CONFIG[2]
-                  present = {key for key, _ in list_keys(f"packages/{project}-{platform}-{arch}-{bt}-")}
                   for san in SANITIZERS[project]:
                       key = expected_key(project, platform, arch, bt, sha, san)
-                      if key in present:
+                      if any(k == key for k, _ in list_keys(key)):
                           artifacts.append(artifact(bt, san, key, ""))
+                      else:
+                          print(f"{bt}-{san}: no tarball for this build, skipping")
               return project, sha, artifacts
 
           def main():
@@ -257,7 +263,10 @@ jobs:
               else:
                   fail(f"unexpected event {event_name}")
 
-              print(f"{event_name}: {project} — {len(artifacts)} artifacts for {platform}/{arch}")
+              # Names (debug, release, debug-asan, debug-tsan) are fixed values, not
+              # payload strings, so they're safe in the public log.
+              print(f"{event_name}: {project} — {len(artifacts)} artifacts for {platform}/{arch}: "
+                    f"{', '.join(a['name'] for a in artifacts)}")
               if debug:
                   print(f"::debug::sha={sha} artifacts={json.dumps(artifacts)}")
               with open(os.path.join(os.environ["RUNNER_TEMP"], "artifacts.json"), "w") as f:
@@ -340,3 +349,8 @@ jobs:
               fail("downloading artifacts failed (re-run with debug logging for details)",
                    traceback.format_exc().replace("\n", " | "))
           PY
+
+          # Disk headroom after extraction (the video linux leg holds four
+          # extracted builds). Sizes only, nothing from the payload.
+          du -sh . | awk '{print $1 " extracted"}'
+          df -h . | tail -1
