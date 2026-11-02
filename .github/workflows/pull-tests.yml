@@ -27,7 +27,7 @@ on:
     #       { "platform": "linux",  "arch": "x86_64", "build_type": "debug", "sanitizer": "asan", ... }
     #     ]
     #   }
-    # Sanitizer artifacts (ASan for voice and video, TSan for voice) are linux
+    # Sanitizer artifacts (ASan and TSan, for voice and video) are linux
     # x86_64 debug only and optional, so a payload from an rtc-cpp build that
     # predates them is still accepted.
     # Each matrix leg filters artifacts to its own platform/arch and downloads
@@ -117,7 +117,7 @@ jobs:
           # Sanitizer builds exist only for this platform/arch/build_type, and
           # only these sanitizers per project (rtc-cpp's build_sanitizer_tests.sh).
           SANITIZER_CONFIG = ("linux", "x86_64", "debug")
-          SANITIZERS = {"voice": ("asan", "tsan"), "video": ("asan",)}
+          SANITIZERS = {"voice": ("asan", "tsan"), "video": ("asan", "tsan")}
           SHA_RE = re.compile(r"[0-9a-f]{7,40}")
           VERSION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,1024}")
 
