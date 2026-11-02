@@ -23,9 +23,13 @@ on:
     #       { "platform": "linux",  "arch": "x86_64", "build_type": "debug",   "key": "packages/...tar.gz", "version_id": "..." },
     #       { "platform": "linux",  "arch": "x86_64", "build_type": "release", ... },
     #       { "platform": "darwin", "arch": "arm64",  "build_type": "debug",   ... },
-    #       { "platform": "darwin", "arch": "arm64",  "build_type": "release", ... }
+    #       { "platform": "darwin", "arch": "arm64",  "build_type": "release", ... },
+    #       { "platform": "linux",  "arch": "x86_64", "build_type": "debug", "sanitizer": "asan", ... }
     #     ]
     #   }
+    # Sanitizer artifacts (ASan for voice and video, TSan for voice) are linux
+    # x86_64 debug only and optional, so a payload from an rtc-cpp build that
+    # predates them is still accepted.
     # Each matrix leg filters artifacts to its own platform/arch and downloads
     # by exact {key, version_id}, so an S3 overwrite between dispatch and
     # download doesn't feed us different bytes than the dispatcher signed off on.
@@ -66,8 +70,9 @@ jobs:
             runner: macos-arm
     runs-on: ${{ matrix.runner }}
     # Bounded so a hung job can't sit holding credentials for GitHub's 6-hour
-    # default. Download + untar takes a couple of minutes.
-    timeout-minutes: 15
+    # default. Download + untar of the per-suite and sanitizer tarballs takes
+    # several minutes.
+    timeout-minutes: 30
     env:
       PLATFORM: ${{ matrix.platform }}
       ARCH: ${{ matrix.arch }}
@@ -82,8 +87,9 @@ jobs:
       - name: Resolve target artifacts
         run: |
           set -euo pipefail
-          # Writes $RUNNER_TEMP/artifacts.json: [{build_type,key,version_id}]
-          # filtered to PLATFORM+ARCH.
+          # Writes $RUNNER_TEMP/artifacts.json: [{name,build_type,sanitizer,key,version_id}]
+          # filtered to PLATFORM+ARCH. `name` is the directory under tests/ the
+          # download step extracts into: debug, release, debug-asan, debug-tsan.
           # repository_dispatch: taken from the payload, with version ids.
           # workflow_dispatch: keys from list-objects-v2, no version ids
           # (mutable-key fallback).
@@ -108,11 +114,20 @@ jobs:
           # build that has all of them, so every leg resolves the same SHA.
           REQUIRED = [("linux", "x86_64"), ("darwin", "arm64")]
           BUILD_TYPES = ("debug", "release")
+          # Sanitizer builds exist only for this platform/arch/build_type, and
+          # only these sanitizers per project (rtc-cpp's build_sanitizer_tests.sh).
+          SANITIZER_CONFIG = ("linux", "x86_64", "debug")
+          SANITIZERS = {"voice": ("asan", "tsan"), "video": ("asan",)}
           SHA_RE = re.compile(r"[0-9a-f]{7,40}")
           VERSION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,1024}")
 
-          def expected_key(project, platform, arch, bt, sha):
-              return f"packages/{project}-{platform}-{arch}-{bt}-{sha}.tar.gz"
+          def expected_key(project, platform, arch, bt, sha, sanitizer=None):
+              variant = f"{bt}-{sanitizer}" if sanitizer else bt
+              return f"packages/{project}-{platform}-{arch}-{variant}-{sha}.tar.gz"
+
+          def artifact(bt, sanitizer, key, vid):
+              return {"name": f"{bt}-{sanitizer}" if sanitizer else bt, "build_type": bt,
+                      "sanitizer": sanitizer, "key": key, "version_id": vid}
 
           def resolve_dispatch(payload, platform, arch):
               project = payload.get("project")
@@ -131,38 +146,45 @@ jobs:
               # Filter to our own platform+arch (payload also carries the other platform).
               mine = [a for a in all_artifacts
                       if isinstance(a, dict) and a.get("platform") == platform and a.get("arch") == arch]
-              if sorted(str(a.get("build_type")) for a in mine) != sorted(BUILD_TYPES):
+              regular = [a for a in mine if a.get("sanitizer") is None]
+              sanitized = [a for a in mine if a.get("sanitizer") is not None]
+              if sorted(str(a.get("build_type")) for a in regular) != sorted(BUILD_TYPES):
                   fail(f"repository_dispatch payload must carry exactly one debug and one release "
                        f"artifact for {platform}/{arch}",
-                       f"build_types={[a.get('build_type') for a in mine]!r}")
+                       f"build_types={[a.get('build_type') for a in regular]!r}")
+              allowed = SANITIZERS[project] if (platform, arch) == SANITIZER_CONFIG[:2] else ()
+              names = [a.get("sanitizer") for a in sanitized]
+              if len(set(names)) != len(names) or not set(names) <= set(allowed):
+                  fail(f"repository_dispatch payload has unexpected sanitizer artifacts for {platform}/{arch}",
+                       f"sanitizers={names!r} allowed={allowed!r}")
               artifacts = []
-              for a in mine:
-                  bt, key, vid = a["build_type"], a.get("key"), a.get("version_id")
+              for a in regular + sanitized:
+                  bt, san, key, vid = a.get("build_type"), a.get("sanitizer"), a.get("key"), a.get("version_id")
+                  label = f"{bt}-{san}" if san else bt
+                  if san and bt != SANITIZER_CONFIG[2]:
+                      fail(f"repository_dispatch payload sanitizer artifact {san} must be a "
+                           f"{SANITIZER_CONFIG[2]} build", f"build_type={bt!r}")
                   # The key must be exactly what the producer's naming scheme yields for
-                  # this project/platform/arch/build_type/sha — nothing outside packages/,
-                  # no other project, no other commit.
-                  want = expected_key(project, platform, arch, bt, sha)
+                  # this project/platform/arch/build_type/sanitizer/sha — nothing outside
+                  # packages/, no other project, no other commit.
+                  want = expected_key(project, platform, arch, bt, sha, san)
                   if key != want:
-                      fail(f"repository_dispatch payload key for {bt} doesn't match the naming scheme",
+                      fail(f"repository_dispatch payload key for {label} doesn't match the naming scheme",
                            f"key={key!r} expected={want!r}")
                   if not isinstance(vid, str) or not VERSION_ID_RE.fullmatch(vid):
-                      fail(f"repository_dispatch payload version_id for {bt} is missing or malformed",
+                      fail(f"repository_dispatch payload version_id for {label} is missing or malformed",
                            f"version_id={vid!r}")
-                  artifacts.append({"build_type": bt, "key": key, "version_id": vid})
+                  artifacts.append(artifact(bt, san, key, vid))
               return project, sha, artifacts
 
-          def newest_complete_sha(project):
-              # One listing for the project, so every matrix leg sees the same
-              # objects. A build counts only once all REQUIRED platforms have
-              # both build types uploaded; otherwise "newest" could be a build
-              # whose release (or other platform) isn't in S3 yet.
+          def list_keys(prefix):
               # `Contents || ``[]``` guards the empty-prefix case: list-objects-v2
               # omits Contents entirely when nothing matches.
               try:
                   q = subprocess.run(
                       ["aws", "s3api", "list-objects-v2",
                        "--bucket", BUCKET,
-                       "--prefix", f"packages/{project}-",
+                       "--prefix", prefix,
                        "--query", "Contents[].[Key, LastModified] || `[]`",
                        "--output", "json"],
                       check=True, capture_output=True, text=True,
@@ -170,12 +192,21 @@ jobs:
               except subprocess.CalledProcessError as e:
                   fail(f"listing s3://{BUCKET}/packages/ failed (re-run with debug logging for details)",
                        e.stderr.strip())
+              return json.loads(q.stdout or "[]")
+
+          def newest_complete_sha(project):
+              # One listing for the project, so every matrix leg sees the same
+              # objects. A build counts only once all REQUIRED platforms have
+              # both build types uploaded; otherwise "newest" could be a build
+              # whose release (or other platform) isn't in S3 yet. Sanitizer
+              # tarballs are optional and don't count.
               wanted = {(p, a, bt) for p, a in REQUIRED for bt in BUILD_TYPES}
               # Basename format: <project>-<platform>-<arch>-<build_type>-<sha>.tar.gz.
               # Known components contain no `-`, so the fields split cleanly.
+              # Sanitizer keys (...-debug-asan-<sha>) don't match: `asan` isn't hex.
               key_re = re.compile(rf"packages/{project}-([a-z0-9]+)-([a-z0-9_]+)-(debug|release)-([0-9a-f]{{7,40}})\.tar\.gz")
               seen, newest = {}, {}
-              for key, modified in json.loads(q.stdout or "[]"):
+              for key, modified in list_keys(f"packages/{project}-"):
                   m = key_re.fullmatch(key)
                   if not m or (m[1], m[2], m[3]) not in wanted:
                       continue
@@ -199,8 +230,16 @@ jobs:
               if not sha:
                   sha = newest_complete_sha(project)
               # No version ids on this path: whatever is at the key now is used.
-              artifacts = [{"build_type": bt, "key": expected_key(project, platform, arch, bt, sha),
-                            "version_id": ""} for bt in BUILD_TYPES]
+              artifacts = [artifact(bt, None, expected_key(project, platform, arch, bt, sha), "")
+                           for bt in BUILD_TYPES]
+              # Sanitizer tarballs are optional: take the ones this build uploaded.
+              if (platform, arch) == SANITIZER_CONFIG[:2]:
+                  bt = SANITIZER_CONFIG[2]
+                  present = {key for key, _ in list_keys(f"packages/{project}-{platform}-{arch}-{bt}-")}
+                  for san in SANITIZERS[project]:
+                      key = expected_key(project, platform, arch, bt, sha, san)
+                      if key in present:
+                          artifacts.append(artifact(bt, san, key, ""))
               return project, sha, artifacts
 
           def main():
@@ -234,7 +273,7 @@ jobs:
                    traceback.format_exc().replace("\n", " | "))
           PY
 
-      - name: Download and untar debug + release
+      - name: Download and untar debug + release (+ sanitizer builds)
         run: |
           set -euo pipefail
           mkdir -p tests
@@ -269,7 +308,8 @@ jobs:
                   resolved = json.load(f)
               bucket = resolved["bucket"]
               for a in resolved["artifacts"]:
-                  bt, key, vid = a["build_type"], a["key"], a["version_id"]
+                  # `bt` is the directory name: debug, release, debug-asan, debug-tsan.
+                  bt, key, vid = a["name"], a["key"], a["version_id"]
                   print(f"--- {bt}" + (" (pinned version)" if vid else " (latest)"))
                   if debug:
                       print(f"::debug::s3://{bucket}/{key} version={vid or '<latest>'}")
