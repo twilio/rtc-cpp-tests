@@ -179,6 +179,12 @@ jobs:
                       fail(f"repository_dispatch payload version_id for {label} is missing or malformed",
                            f"version_id={vid!r}")
                   artifacts.append(artifact(bt, san, key, vid))
+              # rtc-cpp leaves a sanitizer out of the payload when its build failed.
+              # The run still passes, so annotate it to surface on the run summary.
+              # Names come from SANITIZERS, not the payload, so they're log-safe.
+              for missing in [s for s in allowed if s not in names]:
+                  print(f"::warning::{SANITIZER_CONFIG[2]}-{missing}: not in the payload "
+                        f"(the rtc-cpp {missing} build failed or didn't upload), skipping")
               return project, sha, artifacts
 
           def list_keys(prefix):
@@ -245,7 +251,10 @@ jobs:
                       if any(k == key for k, _ in list_keys(key)):
                           artifacts.append(artifact(bt, san, key, ""))
                       else:
-                          print(f"{bt}-{san}: no tarball for this build, skipping")
+                          # newest_complete_sha doesn't wait for the sanitizer builds
+                          # (up to ~2h), so a run soon after a build can land here.
+                          print(f"::warning::{bt}-{san}: no tarball for this build "
+                                f"(failed, or not uploaded yet), skipping")
               return project, sha, artifacts
 
           def main():
