@@ -116,10 +116,16 @@ jobs:
         run: python3 scripts/fetch_artifact.py
 
       - name: Drop AWS credentials
-        # The tests don't need them, so they don't run with them.
+        # The tests don't need them, so they don't run with them. With
+        # `id-token: write`, the runner also gives every step the two
+        # ACTIONS_ID_TOKEN_REQUEST_* variables, which are enough to request a
+        # fresh OIDC token and assume the role again. They're blanked here, and
+        # the steps that run test binaries or npm packages also `unset` them,
+        # in case the runner doesn't let GITHUB_ENV override its own values.
         if: always()
         run: |
-          for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
+          for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
+                   ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN; do
             echo "$v=" >> "$GITHUB_ENV"
           done
 
@@ -134,6 +140,8 @@ jobs:
           EXE: ${{ matrix.exe }}
         run: |
           set -euo pipefail
+          # Whether the GITHUB_ENV blanking above stuck (yes/no, never the value).
+          echo "OIDC token request variables still set: $([ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] && echo yes || echo no)"
           test -x "$BIN_DIR/$EXE" || { echo "::error::$EXE is not in the $VARIANT build"; exit 1; }
           cp media/*.wav "$BIN_DIR/"
           mkdir -p "$(dirname "$RESULTS")"
@@ -168,6 +176,7 @@ jobs:
         working-directory: voice/websocket-server
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
           npm ci --no-audit --no-fund --loglevel=error
           nohup node server.js > "$RUNNER_TEMP/websocket-server.log" 2>&1 &
           for _ in $(seq 1 10); do
@@ -193,6 +202,7 @@ jobs:
           TWILIO_TEST_WEBRTC_TRACE_EVENT_LOGGING: "0"
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
           bin="$GITHUB_WORKSPACE/$BIN_DIR"
           export TEST_PATH="$bin/$EXE" AUDIO_FILE_PATH="$bin/audio_dtx16.wav"
           extra=()
@@ -203,7 +213,10 @@ jobs:
             export TSAN_OPTIONS="second_deadlock_stack=1 history_size=7 die_after_fork=0 suppressions=$bin/tsan_suppressions.txt"
             extra=(-- --disable-signal-handler)
           fi
-          python3 scripts/run_gtest_isolated.py --binary "$TEST_PATH" --label "$NAME" \
+          # exec: on a timeout or cancel the runner signals the step's shell,
+          # not its children; this way the runner gets the signal and records
+          # the interrupted shard.
+          exec python3 scripts/run_gtest_isolated.py --binary "$TEST_PATH" --label "$NAME" \
             --shard "$SHARD" --shards "$SHARDS" --exclude "$EXCLUDE" --results "$RESULTS" ${extra[@]+"${extra[@]}"}
 
       - name: Load network test kernel modules
@@ -234,6 +247,7 @@ jobs:
           TWILIO_TEST_WEBRTC_TRACE_EVENT_LOGGING: "0"
         run: |
           set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
           docker build --quiet -t rtc-cpp-containerized -f docker/containerized.Dockerfile docker > /dev/null
           out="$RUNNER_TEMP/container-out"
           mkdir -p "$out"
@@ -250,7 +264,9 @@ jobs:
           fi
           # Unlike CircleCI, TEST_PATH is passed in and all three wavs sit next
           # to the binary, so the live-transcription test finds its audio.
-          docker run --rm --privileged --cap-add NET_ADMIN --cap-add SYS_PTRACE \
+          # exec, so a timeout or cancel reaches docker run, which forwards it
+          # to the runner in the container (see "Run tests").
+          exec docker run --rm --privileged --cap-add NET_ADMIN --cap-add SYS_PTRACE \
             --name "nw-test-$GITHUB_RUN_ID-$GITHUB_JOB" \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$GITHUB_WORKSPACE/$BIN_DIR:/opt/twilio/tests" \

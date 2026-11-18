@@ -17,7 +17,8 @@ import json
 import os
 import sys
 
-STATUSES = ("passed", "failed", "crashed", "timeout", "disabled")
+STATUSES = ("passed", "skipped", "failed", "crashed", "timeout", "disabled")
+OK_STATUSES = ("passed", "skipped")
 
 
 def main():
@@ -42,7 +43,7 @@ def main():
         c = r.get("counts") or {}
         for s in STATUSES:
             totals[s] += c.get(s, 0)
-        failed = [t for t in r.get("tests", []) if t["status"] != "passed"]
+        failed = [t for t in r.get("tests", []) if t["status"] not in OK_STATUSES]
         if r.get("error"):
             outcome = "ERROR"
             bad_jobs.append((leg["name"], r["error"]))

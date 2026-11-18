@@ -9,13 +9,17 @@ tests/<VARIANT>/tests/.
 repository_dispatch: the artifact comes from the payload and is downloaded by
 exact {key, version_id}, so an S3 overwrite between dispatch and download
 can't feed us different bytes than the dispatcher signed off on.
-workflow_dispatch: the key comes from list-objects-v2 (mutable-key fallback).
-With no `sha` input, the newest build with every platform and both build types
-uploaded at least CUTOFF_MARGIN before CUTOFF (set once by the plan job) is
-used, so all test jobs of a run, including re-runs, resolve the same build. The
-margin covers uploads still in flight at CUTOFF: S3 stamps LastModified when
-an upload starts but lists the object only once it completes, so without it a
-job listing early could miss a tarball that a later job sees.
+workflow_dispatch: keys come from list-object-versions (the bucket is
+versioned). With no `sha` input, the newest build with every platform and both
+build types first uploaded at least CUTOFF_MARGIN before CUTOFF (set once by
+the plan job) is used. Each key is judged by its oldest version, so a re-upload
+of the same commit during a run (a Buildkite rebuild, say) can't make the
+build look incomplete to the jobs that list after it. Each job then downloads
+the newest version uploaded by that time, so all jobs of a run, including
+re-runs, get the same bytes. The margin covers uploads still in flight at
+CUTOFF: S3 stamps LastModified when an upload starts but lists the object only
+once it completes, so without it a job listing early could miss a version that
+a later job sees.
 
 A sanitizer build that's missing (its rtc-cpp build failed or didn't upload)
 isn't an error: "available=false" goes to $GITHUB_OUTPUT and the job skips its
@@ -135,25 +139,30 @@ def resolve_dispatch(payload, platform, arch):
     return project, sha, artifacts
 
 
-def list_keys(prefix):
-    # `Contents || ``[]``` guards the empty-prefix case: list-objects-v2 omits
-    # Contents entirely when nothing matches.
+def list_versions(prefix):
+    """{key: [(last_modified, version_id), ...]} for keys whose latest version
+    isn't a delete marker."""
+    # `|| ``[]``` guards the empty case: the response omits Versions /
+    # DeleteMarkers entirely when there are none.
     try:
         q = subprocess.run(
-            ["aws", "s3api", "list-objects-v2", "--bucket", BUCKET, "--prefix", prefix,
-             "--query", "Contents[].[Key, LastModified] || `[]`", "--output", "json"],
+            ["aws", "s3api", "list-object-versions", "--bucket", BUCKET, "--prefix", prefix,
+             "--query", "{v: Versions[].[Key, LastModified, VersionId] || `[]`, "
+                        "d: DeleteMarkers[?IsLatest].Key || `[]`}",
+             "--output", "json"],
             check=True, capture_output=True, text=True,
         )
     except subprocess.CalledProcessError as e:
-        fail(f"listing s3://{BUCKET}/packages/ failed ({DETAILS_HINT})",
-             e.stderr.strip())
-    return json.loads(q.stdout or "[]")
-
-
-def before_cutoff(modified, cutoff):
-    # list-objects-v2 returns e.g. "2026-11-10T18:01:39+00:00" (always UTC);
-    # compare second-resolution UTC strings, which sort chronologically.
-    return modified[:19] <= cutoff
+        fail(f"listing s3://{BUCKET}/packages/ failed ({DETAILS_HINT})", e.stderr.strip())
+    listing = json.loads(q.stdout or "{}")
+    deleted = set(listing.get("d") or [])
+    versions = {}
+    for key, modified, vid in listing.get("v") or []:
+        if key not in deleted:
+            # list-object-versions returns e.g. "2026-11-10T18:01:39+00:00"
+            # (always UTC); second-resolution UTC strings sort chronologically.
+            versions.setdefault(key, []).append((modified[:19], vid))
+    return versions
 
 
 def newest_complete_sha(project, cutoff):
@@ -166,19 +175,26 @@ def newest_complete_sha(project, cutoff):
     # Known components contain no `-`, so the fields split cleanly. Sanitizer
     # keys (...-debug-asan-<sha>) don't match: `asan` isn't hex.
     key_re = re.compile(rf"packages/{project}-([a-z0-9]+)-([a-z0-9_]+)-(debug|release)-([0-9a-f]{{7,40}})\.tar\.gz")
-    seen, newest = {}, {}
-    for key, modified in list_keys(f"packages/{project}-"):
+    seen, first_upload = {}, {}
+    for key, versions in list_versions(f"packages/{project}-").items():
         m = key_re.fullmatch(key)
-        if not m or (m[1], m[2], m[3]) not in wanted or not before_cutoff(modified, cutoff):
+        oldest = min(modified for modified, _ in versions)
+        if not m or (m[1], m[2], m[3]) not in wanted or oldest > cutoff:
             continue
         sha = m[4]
         seen.setdefault(sha, set()).add((m[1], m[2], m[3]))
-        newest[sha] = max(newest.get(sha, ""), modified)
+        first_upload[sha] = max(first_upload.get(sha, ""), oldest)
     complete = [sha for sha, have in seen.items() if have == wanted]
     if not complete:
         fail(f"no {project} build under s3://{BUCKET}/packages/ has all of "
              f"{sorted(p + '/' + a for p, a in REQUIRED)} in debug and release")
-    return max(complete, key=lambda s: newest[s])
+    return max(complete, key=lambda s: first_upload[s])
+
+
+def version_at(key, cutoff):
+    """Version id of the newest upload of `key` at or before `cutoff`, or None."""
+    versions = [v for v in list_versions(key).get(key, []) if v[0] <= cutoff]
+    return max(versions)[1] if versions else None
 
 
 def resolve_manual(inputs, platform, arch, variant, cutoff):
@@ -188,21 +204,23 @@ def resolve_manual(inputs, platform, arch, variant, cutoff):
     sha = inputs.get("sha") or ""
     if sha and not KEY_SHA_RE.fullmatch(sha):
         fail("'sha' input must be the first 12 hex characters of an rtc-cpp commit", f"sha={sha!r}")
+    if not CUTOFF_RE.fullmatch(cutoff):
+        fail("CUTOFF is missing or malformed")
+    t = datetime.datetime.strptime(cutoff, "%Y-%m-%dT%H:%M:%SZ") - CUTOFF_MARGIN
+    cutoff = t.strftime("%Y-%m-%dT%H:%M:%S")
     if not sha:
-        if not CUTOFF_RE.fullmatch(cutoff):
-            fail("CUTOFF is missing or malformed")
-        t = datetime.datetime.strptime(cutoff, "%Y-%m-%dT%H:%M:%SZ") - CUTOFF_MARGIN
-        sha = newest_complete_sha(project, t.strftime("%Y-%m-%dT%H:%M:%S"))
+        sha = newest_complete_sha(project, cutoff)
     m = VARIANT_RE.fullmatch(variant)
     bt, san = m[1], m[2]
     key = expected_key(project, platform, arch, bt, sha, san)
-    if san:
-        # Sanitizer tarballs are optional: listed by the exact key as prefix,
-        # so only that object can match.
-        if not any(k == key for k, _ in list_keys(key)):
-            return project, sha, []
-    # No version ids on this path: whatever is at the key now is used.
-    return project, sha, [artifact(bt, san, key, "")]
+    # Listed with the exact key as prefix, so only that object's versions match.
+    vid = version_at(key, cutoff)
+    if vid is None:
+        if san:
+            return project, sha, []  # sanitizer tarballs are optional
+        fail(f"{variant}: no {project} {platform}/{arch} tarball for this build uploaded at least "
+             f"{CUTOFF_MARGIN.seconds // 60} minutes before the run started")
+    return project, sha, [artifact(bt, san, key, vid)]
 
 
 def run(what, cmd):
@@ -253,8 +271,7 @@ def main():
     out_dir = os.path.join("tests", variant)
     os.makedirs(out_dir, exist_ok=True)
     tarball = os.path.join(out_dir + ".tar.gz")
-    print(f"{event_name}: {project} {platform}/{arch} {variant}" +
-          (" (pinned version)" if a["version_id"] else " (latest)"))
+    print(f"{event_name}: {project} {platform}/{arch} {variant} (pinned version)")
     cmd = ["aws", "s3api", "get-object", "--bucket", BUCKET, "--key", a["key"]]
     if a["version_id"]:
         cmd += ["--version-id", a["version_id"]]

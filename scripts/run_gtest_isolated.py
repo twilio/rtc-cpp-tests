@@ -5,7 +5,8 @@ Replaces rtc-cpp's scripts/gtest-single (what CircleCI ran) for this repo:
   - every test runs as its own process, so a crash or abort (e.g. RTC_FATAL on
     a missing credential) fails that test and the shard carries on;
   - a per-test timeout (CircleCI: INDIVIDUAL_DURATION=15m);
-  - DISABLED_ tests are counted and skipped;
+  - DISABLED_ tests are counted and skipped, and tests that GTEST_SKIP
+    themselves are reported as skipped, not passed;
   - a summary at the end: counts plus the names of the tests that didn't pass;
   - --results is rewritten after every test, so a shard that's cancelled or
     hits the job timeout still reports what it ran (with an "error").
@@ -29,6 +30,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
+
+# A skipped test isn't a failure; it's counted separately so the counts show
+# what actually ran.
+OK_STATUSES = ("passed", "skipped")
 
 # Grace period between SIGTERM and SIGKILL on timeout (gtest-single: `timeout -k 30s`).
 KILL_GRACE_SECONDS = 30
@@ -91,7 +97,10 @@ def list_tests(binary, exclude):
 
 
 def run_one(binary, name, timeout, test_args, log_path, current):
-    """Run a single test; return (status, seconds). status: passed|failed|crashed|timeout."""
+    """Run a single test; return (status, seconds).
+
+    status: passed|skipped|failed|crashed|timeout.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         xml_path = os.path.join(tmp, "result.xml")
         cmd = [binary, "--gtest_also_run_disabled_tests", f"--gtest_filter={name}",
@@ -120,7 +129,18 @@ def run_one(binary, name, timeout, test_args, log_path, current):
             return "crashed", elapsed
         # Nonzero with an XML: a gtest failure, or a sanitizer report at exit
         # (TSan exits 66 after the run when it found races).
-        return ("passed" if rc == 0 else "failed"), elapsed
+        if rc != 0:
+            return "failed", elapsed
+        # GTEST_SKIP exits 0 too; only the XML tells it apart from a pass.
+        return ("skipped" if was_skipped(xml_path) else "passed"), elapsed
+
+
+def was_skipped(xml_path):
+    try:
+        cases = ET.parse(xml_path).getroot().iter("testcase")
+        return any(c.get("result") == "skipped" for c in cases)
+    except ET.ParseError:
+        return False
 
 
 def kill_group(proc):
@@ -186,12 +206,11 @@ def write_step_summary(label, counts, results):
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
         return
-    bad = [r for r in results if r["status"] != "passed"]
+    bad = [r for r in results if r["status"] not in OK_STATUSES]
     with open(path, "a") as f:
         f.write(f"### {label}\n\n")
-        f.write("| passed | failed | crashed | timeout | disabled |\n|---|---|---|---|---|\n")
-        f.write(f"| {counts['passed']} | {counts['failed']} | {counts['crashed']} | "
-                f"{counts['timeout']} | {counts['disabled']} |\n\n")
+        f.write("| " + " | ".join(counts) + " |\n|" + "---|" * len(counts) + "\n")
+        f.write("| " + " | ".join(str(v) for v in counts.values()) + " |\n\n")
         if bad:
             f.write("<details><summary>Tests that didn't pass</summary>\n\n")
             for r in bad:
@@ -218,7 +237,7 @@ def write_json(path, data):
 def main():
     a = parse_args()
     binary = os.path.abspath(a.binary)
-    counts = {"passed": 0, "failed": 0, "crashed": 0, "timeout": 0, "disabled": 0}
+    counts = {"passed": 0, "skipped": 0, "failed": 0, "crashed": 0, "timeout": 0, "disabled": 0}
     summary = {"label": a.label, "shard": a.shard, "shards": a.shards, "counts": counts,
                "tests": [], "error": None}
 
@@ -288,16 +307,16 @@ def main():
     else:
         summary["error"] = None
 
-    bad = [t for t in summary["tests"] if t["status"] != "passed"]
+    bad = [t for t in summary["tests"] if t["status"] not in OK_STATUSES]
     print("\n========== SUMMARY: " + a.label + " ==========")
-    print(f"passed {counts['passed']}, failed {counts['failed']}, crashed {counts['crashed']}, "
-          f"timeout {counts['timeout']}, disabled (skipped) {counts['disabled']}")
+    print(f"passed {counts['passed']}, skipped {counts['skipped']}, failed {counts['failed']}, "
+          f"crashed {counts['crashed']}, timeout {counts['timeout']}, disabled {counts['disabled']}")
     if bad:
         print(f"{len(bad)} test(s) did not pass:")
         for t in bad:
             print(f"  - {t['name']} [{t['status']}]")
     elif names and not summary["error"]:
-        print(f"All {len(names)} tests passed")
+        print(f"All {len(names)} tests passed or skipped")
     write_step_summary(a.label, counts, summary["tests"])
     finish(1 if bad or summary["error"] else 0)
 
