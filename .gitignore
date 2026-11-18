@@ -7,3 +7,9 @@ infra/*.tfvars
 infra/*.tfvars.json
 infra/crash.log
 infra/crash.*.log
+
+# Terraform plans embed the full state (ARNs, account id).
+*.tfplan
+
+# Python bytecode (from running scripts/ locally).
+__pycache__/

@@ -1,4 +1,4 @@
-name: Pull rtc-cpp tests
+name: rtc-cpp tests
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
         options: [voice, video]
         default: voice
       sha:
-        description: "Short SHA of the rtc-cpp build (leave empty for the newest complete build under packages/)"
+        description: "First 12 characters of the rtc-cpp commit (empty: the newest build with every platform uploaded, at least 10 minutes old)"
         required: false
         default: ""
   repository_dispatch:
@@ -31,335 +31,317 @@ on:
     # Sanitizer artifacts (ASan and TSan, for voice and video) are linux
     # x86_64 debug only and optional, so a payload from an rtc-cpp build that
     # predates them is still accepted.
-    # Each matrix leg filters artifacts to its own platform/arch and downloads
-    # by exact {key, version_id}, so an S3 overwrite between dispatch and
-    # download doesn't feed us different bytes than the dispatcher signed off on.
     types: [rtc-cpp-tests-ready]
 
 permissions:
-  id-token: write
   contents: read
 
-# Logging policy: this repo is public, so its Actions logs are too, while
-# rtc-cpp is private. Normal runs print only project/platform/build_type and
-# counts. rtc-cpp SHAs, S3 keys, version ids, extracted file names, and aws/tar
-# error output are printed only when RUNNER_DEBUG=1 ("Re-run jobs" → "Enable
-# debug logging"), which requires repo write access to turn on.
-#
-# GitHub prints every `env:` value (after expanding `${{ }}`) at the top of each
-# step's log, including step outputs used there. So nothing sensitive goes
-# through `env:`, step outputs, or `${{ }}` in a `run:` script: the payload and
-# inputs are read from $GITHUB_EVENT_PATH, and the resolved artifact list is
-# handed to the download step in a file under $RUNNER_TEMP.
+# Logging policy: this repo is public, so its Actions logs and artifacts are
+# too (any signed-in GitHub user can download a public repo's artifacts),
+# while rtc-cpp is private.
+#   - rtc-cpp SHAs, S3 keys, version ids and extracted file names are never
+#     printed, not even with debug logging (its log is just as public). See
+#     scripts/fetch_artifact.py.
+#   - Test stdout/stderr and gtest XML (SDK/WebRTC logs, assertion text) are
+#     discarded on the runner; only test names, statuses and counts are
+#     printed and uploaded. See scripts/run_gtest_isolated.py.
+#   - GitHub prints every `env:` value (after expanding `${{ }}`) at the top of
+#     each step's log, including step outputs used there. So nothing sensitive
+#     goes through `env:`, step outputs, or `${{ }}` in a `run:` script: the
+#     payload and inputs are read from $GITHUB_EVENT_PATH.
 
 jobs:
-  pull:
-    name: pull (${{ matrix.platform }}-${{ matrix.arch }})
-    # One job definition for every platform, so the resolve/validate/download
-    # logic exists exactly once. Add a platform by adding a matrix entry, and to
-    # REQUIRED in the resolve step.
+  plan:
+    # Builds the test matrix (fixed tables in scripts/plan_matrix.py) and the
+    # cutoff a manual "newest build" run resolves against, so every test job
+    # (and any re-run of one) picks the same rtc-cpp build.
+    runs-on: ubuntu-x64
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      cutoff: ${{ steps.plan.outputs.cutoff }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: plan
+        run: |
+          set -euo pipefail
+          # Assigned first: `set -e` ignores a failing $(...) inside echo.
+          matrix="$(python3 scripts/plan_matrix.py)"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "cutoff=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: ${{ matrix.name }}
+    needs: plan
+    # One job per (suite, platform, build variant, shard), so a run takes
+    # about as long as its slowest shard. The shard counts are CircleCI's
+    # `parallelism` for the same job.
     strategy:
-      # A failure on one platform shouldn't cancel the other's run.
+      # One failing job shouldn't cancel the rest.
       fail-fast: false
-      matrix:
-        include:
-          - platform: linux
-            arch: x86_64
-            runner: ubuntu-x64
-          - platform: darwin
-            arch: arm64
-            runner: macos-arm
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
-    # Bounded so a hung job can't sit holding credentials for GitHub's 6-hour
-    # default. Download + untar of the per-suite and sanitizer tarballs takes
-    # several minutes.
-    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+    # Each test has its own 15-minute timeout; this bounds a whole shard. The
+    # test steps time out 15 minutes earlier, so the results still upload.
+    timeout-minutes: 240
     env:
       PLATFORM: ${{ matrix.platform }}
       ARCH: ${{ matrix.arch }}
+      VARIANT: ${{ matrix.variant }}
+      BIN_DIR: tests/${{ matrix.variant }}/tests
+      RESULTS: ${{ github.workspace }}/results/results-${{ matrix.name }}.json
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - uses: aws-actions/configure-aws-credentials@67fbcbb121271f7775d2e7715933280b06314838 # v1 — Twilio enterprise-allowlisted SHA
         with:
           # Set the AWS_ROLE_ARN Actions Variable in repo settings, so the ARN
           # isn't in the workflow file.
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: us-east-1
+          # Only needed for the download below; the minimum STS allows.
+          role-duration-seconds: 900
 
-      - name: Resolve target artifacts
+      - name: Download the test build
+        id: fetch
+        env:
+          CUTOFF: ${{ needs.plan.outputs.cutoff }}
+        run: python3 scripts/fetch_artifact.py
+
+      - name: Drop AWS credentials
+        # The tests don't need them, so they don't run with them. With
+        # `id-token: write`, the runner also gives every step the two
+        # ACTIONS_ID_TOKEN_REQUEST_* variables, which are enough to request a
+        # fresh OIDC token and assume the role again. They're blanked here, and
+        # the steps that run test binaries or npm packages also `unset` them,
+        # in case the runner doesn't let GITHUB_ENV override its own values.
+        if: always()
+        run: |
+          for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
+                   ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN; do
+            echo "$v=" >> "$GITHUB_ENV"
+          done
+
+      - name: Stage media files
+        if: steps.fetch.outputs.available == 'true'
+        # In rtc-cpp these sit next to the test binaries (CMake POST_BUILD
+        # copies), and the tests find them via dirname($TEST_PATH) or the cwd;
+        # AUDIO_FILE_PATH points at audio_dtx16.wav. The tarballs only carry
+        # the executables, so this repo supplies them (copied from
+        # rtc-cpp common/test/support/voice_engine/).
+        env:
+          EXE: ${{ matrix.exe }}
         run: |
           set -euo pipefail
-          # Writes $RUNNER_TEMP/artifacts.json: [{name,build_type,sanitizer,key,version_id}]
-          # filtered to PLATFORM+ARCH. `name` is the directory under tests/ the
-          # download step extracts into: debug, release, debug-asan, debug-tsan.
-          # repository_dispatch: taken from the payload, with version ids.
-          # workflow_dispatch: keys from list-objects-v2, no version ids
-          # (mutable-key fallback).
-          python3 <<'PY'
-          import json, os, re, subprocess, sys, traceback
+          # Whether the GITHUB_ENV blanking above stuck (yes/no, never the value).
+          echo "OIDC token request variables still set: $([ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] && echo yes || echo no)"
+          test -x "$BIN_DIR/$EXE" || { echo "::error::$EXE is not in the $VARIANT build"; exit 1; }
+          cp media/*.wav "$BIN_DIR/"
+          mkdir -p "$(dirname "$RESULTS")"
 
-          debug = os.environ.get("RUNNER_DEBUG") == "1"
+      - name: Install linux runtime libraries
+        # Every linux test binary links libX11.so.6 (the containerized image
+        # installs it too).
+        if: steps.fetch.outputs.available == 'true' && matrix.platform == 'linux' && !matrix.containerized
+        run: |
+          dpkg -s libx11-6 > /dev/null 2>&1 && exit 0
+          sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends libx11-6
 
-          def fail(msg, detail=None):
-              # `msg` goes to the public log and must not contain SHAs, keys,
-              # version ids or payload values; `detail` only shows in debug.
-              if debug and detail:
-                  print(f"::debug::{detail}")
-              print(f"::error::{msg}")
-              sys.exit(1)
+      - name: Allow sanitizer runtimes on this kernel
+        # Ubuntu 24.04 runners use vm.mmap_rnd_bits=32, which ASan/TSan
+        # binaries from older toolchains can't map their shadow memory under.
+        if: steps.fetch.outputs.available == 'true' && matrix.sanitizer != ''
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
 
-          # Hardcoded, not taken from the payload: anyone who can fire a
-          # repository_dispatch shouldn't be able to point the runner at a
-          # bucket of their choosing.
-          BUCKET = "cpp-test-artifacts"
-          # Every platform/arch the matrix runs. A manual "newest" run picks a
-          # build that has all of them, so every leg resolves the same SHA.
-          REQUIRED = [("linux", "x86_64"), ("darwin", "arm64")]
-          BUILD_TYPES = ("debug", "release")
-          # Sanitizer builds exist only for this platform/arch/build_type, and
-          # only these sanitizers per project (rtc-cpp's build_sanitizer_tests.sh).
-          SANITIZER_CONFIG = ("linux", "x86_64", "debug")
-          SANITIZERS = {"voice": ("asan", "tsan"), "video": ("asan", "tsan")}
-          SHA_RE = re.compile(r"[0-9a-f]{7,40}")
-          VERSION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,1024}")
+      - name: Set up Node for the voice websocket server
+        if: steps.fetch.outputs.available == 'true' && matrix.project == 'voice' && matrix.suite == 'integration' && matrix.platform == 'darwin'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
 
-          def expected_key(project, platform, arch, bt, sha, sanitizer=None):
-              variant = f"{bt}-{sanitizer}" if sanitizer else bt
-              return f"packages/{project}-{platform}-{arch}-{variant}-{sha}.tar.gz"
-
-          def artifact(bt, sanitizer, key, vid):
-              return {"name": f"{bt}-{sanitizer}" if sanitizer else bt, "build_type": bt,
-                      "sanitizer": sanitizer, "key": key, "version_id": vid}
-
-          def resolve_dispatch(payload, platform, arch):
-              project = payload.get("project")
-              if project not in ("voice", "video"):
-                  fail("repository_dispatch payload has a missing or invalid 'project'",
-                       f"project={project!r}")
-              if payload.get("bucket") not in (None, BUCKET):
-                  fail(f"repository_dispatch payload bucket is not {BUCKET}",
-                       f"bucket={payload.get('bucket')!r}")
-              sha = payload.get("sha")
-              if not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
-                  fail("repository_dispatch payload 'sha' is not a hex commit SHA", f"sha={sha!r}")
-              all_artifacts = payload.get("artifacts")
-              if not isinstance(all_artifacts, list):
-                  fail("repository_dispatch payload 'artifacts' is missing or not a list")
-              # Filter to our own platform+arch (payload also carries the other platform).
-              mine = [a for a in all_artifacts
-                      if isinstance(a, dict) and a.get("platform") == platform and a.get("arch") == arch]
-              regular = [a for a in mine if a.get("sanitizer") is None]
-              sanitized = [a for a in mine if a.get("sanitizer") is not None]
-              if sorted(str(a.get("build_type")) for a in regular) != sorted(BUILD_TYPES):
-                  fail(f"repository_dispatch payload must carry exactly one debug and one release "
-                       f"artifact for {platform}/{arch}",
-                       f"build_types={[a.get('build_type') for a in regular]!r}")
-              # The allowlist and build_type checks below must run before any fail()
-              # that names `san`/`label`: those come from the payload, and are only
-              # safe in the public log once they're known to be allowed values.
-              allowed = SANITIZERS[project] if (platform, arch) == SANITIZER_CONFIG[:2] else ()
-              names = [a.get("sanitizer") for a in sanitized]
-              if len(set(names)) != len(names) or not set(names) <= set(allowed):
-                  fail(f"repository_dispatch payload has unexpected sanitizer artifacts for {platform}/{arch}",
-                       f"sanitizers={names!r} allowed={allowed!r}")
-              artifacts = []
-              for a in regular + sanitized:
-                  bt, san, key, vid = a.get("build_type"), a.get("sanitizer"), a.get("key"), a.get("version_id")
-                  label = f"{bt}-{san}" if san else bt
-                  if san and bt != SANITIZER_CONFIG[2]:
-                      fail(f"repository_dispatch payload sanitizer artifact {san} must be a "
-                           f"{SANITIZER_CONFIG[2]} build", f"build_type={bt!r}")
-                  # The key must be exactly what the producer's naming scheme yields for
-                  # this project/platform/arch/build_type/sanitizer/sha — nothing outside
-                  # packages/, no other project, no other commit.
-                  want = expected_key(project, platform, arch, bt, sha, san)
-                  if key != want:
-                      fail(f"repository_dispatch payload key for {label} doesn't match the naming scheme",
-                           f"key={key!r} expected={want!r}")
-                  if not isinstance(vid, str) or not VERSION_ID_RE.fullmatch(vid):
-                      fail(f"repository_dispatch payload version_id for {label} is missing or malformed",
-                           f"version_id={vid!r}")
-                  artifacts.append(artifact(bt, san, key, vid))
-              # rtc-cpp leaves a sanitizer out of the payload when its build failed.
-              # The run still passes, so annotate it to surface on the run summary.
-              # Names come from SANITIZERS, not the payload, so they're log-safe.
-              for missing in [s for s in allowed if s not in names]:
-                  print(f"::warning::{SANITIZER_CONFIG[2]}-{missing}: not in the payload "
-                        f"(the rtc-cpp {missing} build failed or didn't upload), skipping")
-              return project, sha, artifacts
-
-          def list_keys(prefix):
-              # `Contents || ``[]``` guards the empty-prefix case: list-objects-v2
-              # omits Contents entirely when nothing matches.
-              try:
-                  q = subprocess.run(
-                      ["aws", "s3api", "list-objects-v2",
-                       "--bucket", BUCKET,
-                       "--prefix", prefix,
-                       "--query", "Contents[].[Key, LastModified] || `[]`",
-                       "--output", "json"],
-                      check=True, capture_output=True, text=True,
-                  )
-              except subprocess.CalledProcessError as e:
-                  fail(f"listing s3://{BUCKET}/packages/ failed (re-run with debug logging for details)",
-                       e.stderr.strip())
-              return json.loads(q.stdout or "[]")
-
-          def newest_complete_sha(project):
-              # One listing for the project, so every matrix leg sees the same
-              # objects. A build counts only once all REQUIRED platforms have
-              # both build types uploaded; otherwise "newest" could be a build
-              # whose release (or other platform) isn't in S3 yet. Sanitizer
-              # tarballs are optional and don't count.
-              wanted = {(p, a, bt) for p, a in REQUIRED for bt in BUILD_TYPES}
-              # Basename format: <project>-<platform>-<arch>-<build_type>-<sha>.tar.gz.
-              # Known components contain no `-`, so the fields split cleanly.
-              # Sanitizer keys (...-debug-asan-<sha>) don't match: `asan` isn't hex.
-              key_re = re.compile(rf"packages/{project}-([a-z0-9]+)-([a-z0-9_]+)-(debug|release)-([0-9a-f]{{7,40}})\.tar\.gz")
-              seen, newest = {}, {}
-              for key, modified in list_keys(f"packages/{project}-"):
-                  m = key_re.fullmatch(key)
-                  if not m or (m[1], m[2], m[3]) not in wanted:
-                      continue
-                  sha = m[4]
-                  seen.setdefault(sha, set()).add((m[1], m[2], m[3]))
-                  newest[sha] = max(newest.get(sha, ""), modified)
-              complete = [sha for sha, have in seen.items() if have == wanted]
-              if not complete:
-                  fail(f"no {project} build under s3://{BUCKET}/packages/ has all of "
-                       f"{sorted(p + '/' + a for p, a in REQUIRED)} in debug and release")
-              # ISO-8601 timestamps sort chronologically as strings.
-              return max(complete, key=lambda s: newest[s])
-
-          def resolve_manual(inputs, platform, arch):
-              project = inputs.get("project") or "voice"
-              if project not in ("voice", "video"):
-                  fail("invalid 'project' input", f"project={project!r}")
-              sha = inputs.get("sha") or ""
-              if sha and not SHA_RE.fullmatch(sha):
-                  fail("'sha' input is not a hex commit SHA", f"sha={sha!r}")
-              if not sha:
-                  sha = newest_complete_sha(project)
-              # No version ids on this path: whatever is at the key now is used.
-              artifacts = [artifact(bt, None, expected_key(project, platform, arch, bt, sha), "")
-                           for bt in BUILD_TYPES]
-              # Sanitizer tarballs are optional: take the ones this build uploaded.
-              # Listed by the exact key as prefix, so only that object can match.
-              if (platform, arch) == SANITIZER_CONFIG[:2]:
-                  bt = SANITIZER_CONFIG[2]
-                  for san in SANITIZERS[project]:
-                      key = expected_key(project, platform, arch, bt, sha, san)
-                      if any(k == key for k, _ in list_keys(key)):
-                          artifacts.append(artifact(bt, san, key, ""))
-                      else:
-                          # newest_complete_sha doesn't wait for the sanitizer builds
-                          # (up to ~2h), so a run soon after a build can land here.
-                          print(f"::warning::{bt}-{san}: no tarball for this build "
-                                f"(failed, or not uploaded yet), skipping")
-              return project, sha, artifacts
-
-          def main():
-              platform, arch = os.environ["PLATFORM"], os.environ["ARCH"]
-              event_name = os.environ["GITHUB_EVENT_NAME"]
-              with open(os.environ["GITHUB_EVENT_PATH"]) as f:
-                  event = json.load(f)
-              if event_name == "repository_dispatch":
-                  payload = event.get("client_payload")
-                  if not isinstance(payload, dict):
-                      fail("repository_dispatch has no client_payload object")
-                  project, sha, artifacts = resolve_dispatch(payload, platform, arch)
-              elif event_name == "workflow_dispatch":
-                  project, sha, artifacts = resolve_manual(event.get("inputs") or {}, platform, arch)
-              else:
-                  fail(f"unexpected event {event_name}")
-
-              # Names (debug, release, debug-asan, debug-tsan) are fixed values, not
-              # payload strings, so they're safe in the public log.
-              print(f"{event_name}: {project} — {len(artifacts)} artifacts for {platform}/{arch}: "
-                    f"{', '.join(a['name'] for a in artifacts)}")
-              if debug:
-                  print(f"::debug::sha={sha} artifacts={json.dumps(artifacts)}")
-              with open(os.path.join(os.environ["RUNNER_TEMP"], "artifacts.json"), "w") as f:
-                  json.dump({"bucket": BUCKET, "artifacts": artifacts}, f)
-
-          try:
-              main()
-          except SystemExit:
-              raise
-          except Exception:
-              # A traceback can carry payload values in exception messages.
-              fail("resolving artifacts failed (re-run with debug logging for details)",
-                   traceback.format_exc().replace("\n", " | "))
-          PY
-
-      - name: Download and untar debug + release (+ sanitizer builds)
+      - name: Start the voice websocket server
+        # CircleCI started it for voice integration on darwin only: the
+        # voice-notify tests that use it are only built for darwin. Without
+        # NGROK_AUTHTOKEN and the test-account .env (credentials aren't vended
+        # yet, VBLOCKS-7638) it runs local-only and those tests fail. Its
+        # output can carry call tokens, so it goes to a file, not the log.
+        if: steps.fetch.outputs.available == 'true' && matrix.project == 'voice' && matrix.suite == 'integration' && matrix.platform == 'darwin'
+        working-directory: voice/websocket-server
         run: |
           set -euo pipefail
-          mkdir -p tests
-          cd tests
+          unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
+          npm ci --no-audit --no-fund --loglevel=error
+          nohup node server.js > "$RUNNER_TEMP/websocket-server.log" 2>&1 &
+          for _ in $(seq 1 10); do
+            curl -sf http://localhost:3000/publicUrl > /dev/null && { echo "websocket server is up"; exit 0; }
+            sleep 1
+          done
+          echo "::warning::the voice websocket server didn't come up; its tests will fail"
 
-          # For repository_dispatch, version_id is non-empty and we download the
-          # exact object version the dispatcher recorded. For workflow_dispatch,
-          # it's empty and we take whatever is at the key now.
-          python3 <<'PY'
-          import json, os, subprocess, sys, traceback
+      - name: Run tests
+        if: steps.fetch.outputs.available == 'true' && !matrix.containerized
+        timeout-minutes: 225
+        env:
+          NAME: ${{ matrix.name }}
+          EXE: ${{ matrix.exe }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ matrix.shards }}
+          EXCLUDE: ${{ matrix.exclude }}
+          SANITIZER: ${{ matrix.sanitizer }}
+          TWILIO_ENVIRONMENT: Production
+          # CircleCI: 5/3 for regular test jobs, 0/0 for sanitizer jobs.
+          TWILIO_TEST_LOG_LEVEL: ${{ matrix.sanitizer == '' && '5' || '0' }}
+          TWILIO_TEST_WEBRTC_LOG_LEVEL: ${{ matrix.sanitizer == '' && '3' || '0' }}
+          TWILIO_TEST_WEBRTC_TRACE_EVENT_LOGGING: "0"
+        run: |
+          set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
+          bin="$GITHUB_WORKSPACE/$BIN_DIR"
+          export TEST_PATH="$bin/$EXE" AUDIO_FILE_PATH="$bin/audio_dtx16.wav"
+          extra=()
+          if [ -n "$SANITIZER" ]; then
+            # CircleCI's sanitizer options; the suppressions file ships in the
+            # TSan tarball.
+            export ASAN_OPTIONS=detect_leaks=0
+            export TSAN_OPTIONS="second_deadlock_stack=1 history_size=7 die_after_fork=0 suppressions=$bin/tsan_suppressions.txt"
+            extra=(-- --disable-signal-handler)
+          fi
+          # exec: on a timeout or cancel the runner signals the step's shell,
+          # not its children; this way the runner gets the signal and records
+          # the interrupted shard.
+          exec python3 scripts/run_gtest_isolated.py --binary "$TEST_PATH" --label "$NAME" \
+            --shard "$SHARD" --shards "$SHARDS" --exclude "$EXCLUDE" --results "$RESULTS" ${extra[@]+"${extra[@]}"}
 
-          debug = os.environ.get("RUNNER_DEBUG") == "1"
+      - name: Load network test kernel modules
+        # The container can't load modules itself. Privileged containers
+        # usually get them autoloaded on first use; loading them here makes a
+        # missing one show up as a warning, not as failing network tests.
+        if: steps.fetch.outputs.available == 'true' && matrix.containerized
+        run: |
+          sudo modprobe -a sch_netem xt_statistic xt_iprange xt_multiport \
+            || echo "::warning::couldn't load the tc netem / iptables match modules; network tests that use them will fail"
 
-          def fail(msg, detail=None):
-              # Same rule as the resolve step: `msg` is public, `detail` is debug-only.
-              if debug and detail:
-                  print(f"::debug::{detail}")
-              print(f"::error::{msg}")
-              sys.exit(1)
+      - name: Run containerized tests
+        # The network tests break the network (ip/tc/iptables) and move
+        # between docker networks, so they run in a privileged container that
+        # drives the host docker daemon through its socket, as in CircleCI.
+        if: steps.fetch.outputs.available == 'true' && matrix.containerized
+        timeout-minutes: 225
+        env:
+          NAME: ${{ matrix.name }}
+          EXE: ${{ matrix.exe }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ matrix.shards }}
+          EXCLUDE: ${{ matrix.exclude }}
+          SANITIZER: ${{ matrix.sanitizer }}
+          TWILIO_ENVIRONMENT: Production
+          TWILIO_TEST_LOG_LEVEL: ${{ matrix.sanitizer == '' && '5' || '0' }}
+          TWILIO_TEST_WEBRTC_LOG_LEVEL: ${{ matrix.sanitizer == '' && '3' || '0' }}
+          TWILIO_TEST_WEBRTC_TRACE_EVENT_LOGGING: "0"
+        run: |
+          set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
+          docker build --quiet -t rtc-cpp-containerized -f docker/containerized.Dockerfile docker > /dev/null
+          out="$RUNNER_TEMP/container-out"
+          mkdir -p "$out"
+          # The runner writes its results file straight into results/, after
+          # every test, so it survives a timeout or cancel.
+          results_dir="$(dirname "$RESULTS")"
+          opts=()
+          extra=()
+          if [ -n "$SANITIZER" ]; then
+            opts=(-e ASAN_OPTIONS=detect_leaks=0)
+            # CircleCI passed "-disable-signal-handler" (one dash) here, which
+            # the test runner doesn't recognise. Fixed.
+            extra=(-- --disable-signal-handler)
+          fi
+          # Unlike CircleCI, TEST_PATH is passed in and all three wavs sit next
+          # to the binary, so the live-transcription test finds its audio.
+          # exec, so a timeout or cancel reaches docker run, which forwards it
+          # to the runner in the container (see "Run tests").
+          exec docker run --rm --privileged --cap-add NET_ADMIN --cap-add SYS_PTRACE \
+            --name "nw-test-$GITHUB_RUN_ID-$GITHUB_JOB" \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$GITHUB_WORKSPACE/$BIN_DIR:/opt/twilio/tests" \
+            -v "$GITHUB_WORKSPACE/scripts:/opt/twilio/scripts:ro" \
+            -v "$out:/out" \
+            -v "$results_dir:/out/results" \
+            -e TEST_PATH="/opt/twilio/tests/$EXE" \
+            -e AUDIO_FILE_PATH=/opt/twilio/tests/audio_dtx16.wav \
+            -e TWILIO_ENVIRONMENT -e TWILIO_TEST_LOG_LEVEL -e TWILIO_TEST_WEBRTC_LOG_LEVEL \
+            -e TWILIO_TEST_WEBRTC_TRACE_EVENT_LOGGING \
+            -e GITHUB_STEP_SUMMARY=/out/step-summary.md \
+            ${opts[@]+"${opts[@]}"} \
+            rtc-cpp-containerized \
+            python3 /opt/twilio/scripts/run_gtest_isolated.py --binary "/opt/twilio/tests/$EXE" \
+              --label "$NAME" --shard "$SHARD" --shards "$SHARDS" --exclude "$EXCLUDE" \
+              --restore-routes --results "/out/results/$(basename "$RESULTS")" ${extra[@]+"${extra[@]}"}
 
-          def step(bt, what, cmd):
-              # check=True would raise CalledProcessError, whose message is the
-              # full command line (key, version id), so run unchecked and report
-              # generically instead.
-              r = subprocess.run(cmd, capture_output=True, text=True)
-              if r.returncode != 0:
-                  fail(f"{bt}: {what} failed (re-run with debug logging for details)",
-                       (r.stderr or "").strip().replace("\n", " | "))
+      - name: Clean up the test container
+        # A cancelled `docker run` leaves its container (and the step summary
+        # it wrote) behind.
+        if: always() && matrix.containerized
+        run: |
+          docker rm -f "nw-test-$GITHUB_RUN_ID-$GITHUB_JOB" > /dev/null 2>&1 || true
+          f="$RUNNER_TEMP/container-out/step-summary.md"
+          if [ -f "$f" ]; then cat "$f" >> "$GITHUB_STEP_SUMMARY"; fi
 
-          def main():
-              with open(os.path.join(os.environ["RUNNER_TEMP"], "artifacts.json")) as f:
-                  resolved = json.load(f)
-              bucket = resolved["bucket"]
-              for a in resolved["artifacts"]:
-                  # `bt` is the directory name: debug, release, debug-asan, debug-tsan.
-                  bt, key, vid = a["name"], a["key"], a["version_id"]
-                  print(f"--- {bt}" + (" (pinned version)" if vid else " (latest)"))
-                  if debug:
-                      print(f"::debug::s3://{bucket}/{key} version={vid or '<latest>'}")
-                  cmd = ["aws", "s3api", "get-object", "--bucket", bucket, "--key", key]
-                  if vid:
-                      cmd += ["--version-id", vid]
-                  # get-object prints the response (VersionId, ETag, metadata) as
-                  # JSON on stdout; it's captured, not printed.
-                  step(bt, "download", cmd + [f"{bt}.tar.gz"])
-                  os.makedirs(bt, exist_ok=True)
-                  step(bt, "extract", ["tar", "-xzf", f"{bt}.tar.gz", "-C", bt])
-                  os.remove(f"{bt}.tar.gz")
-                  # Tarballs are staged with a `tests/` root by the producer so
-                  # voice and video extract identically; expect `<bt>/tests/...`.
-                  files = [os.path.join(d, n) for d, _, names in os.walk(bt) for n in names]
-                  if not files:
-                      fail(f"{bt} tarball extracted no files")
-                  print(f"extracted {len(files)} files to tests/{bt}")
-                  if debug:
-                      for p in files:
-                          print(f"::debug::{p}")
+      - name: Record skipped job
+        if: steps.fetch.outputs.available == 'false'
+        run: |
+          mkdir -p "$(dirname "$RESULTS")"
+          echo '{"skipped": true}' > "$RESULTS"
 
-          try:
-              main()
-          except SystemExit:
-              raise
-          except Exception:
-              fail("downloading artifacts failed (re-run with debug logging for details)",
-                   traceback.format_exc().replace("\n", " | "))
-          PY
+      - name: Record a job that didn't run its tests
+        # Every job uploads a results file, so a re-run attempt that fails
+        # early replaces the earlier attempt's results instead of leaving
+        # them in the summary.
+        if: always()
+        run: |
+          mkdir -p "$(dirname "$RESULTS")"
+          [ -f "$RESULTS" ] || echo '{"error": "the job failed before it ran any tests"}' > "$RESULTS"
 
-          # Disk headroom after extraction (the video linux leg holds four
-          # extracted builds). Sizes only, nothing from the payload.
-          du -sh . | awk '{print $1 " extracted"}'
-          df -h . | tail -1
+      - name: Upload results
+        # Test names and statuses only (see the logging policy above).
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-${{ matrix.name }}
+          path: results/
+          if-no-files-found: error
+          # Replace an earlier attempt's artifact when a job is re-run.
+          overwrite: true
+          retention-days: 14
+
+  summary:
+    # The combined result of every test job: which jobs and tests didn't pass.
+    needs: [plan, test]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-x64
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: results-*
+          path: results
+          merge-multiple: true
+      - name: Summarize
+        env:
+          RESULTS_DIR: results
+        # The matrix is rebuilt from the event (same tables, same result)
+        # rather than passed through `env:`, which would print all of it.
+        run: |
+          set -euo pipefail
+          MATRIX="$(python3 scripts/plan_matrix.py 2>/dev/null)"
+          export MATRIX
+          python3 scripts/summarize_results.py

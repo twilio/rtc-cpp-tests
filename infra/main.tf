@@ -103,9 +103,11 @@ data "aws_iam_policy_document" "test_artifacts_read" {
     ]
     resources = ["arn:aws:s3:::${local.test_bucket}/packages/*"]
   }
+  # ListBucketVersions: a manual run picks its build by each key's first
+  # upload time and pins the version it downloads (scripts/fetch_artifact.py).
   statement {
     effect    = "Allow"
-    actions   = ["s3:ListBucket"]
+    actions   = ["s3:ListBucket", "s3:ListBucketVersions"]
     resources = ["arn:aws:s3:::${local.test_bucket}"]
     condition {
       test     = "StringLike"
